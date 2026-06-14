@@ -18,6 +18,30 @@ MAX_EPISODE_STEPS = 5
 RANDOM_SEED = 2026
 
 
+def resolve_library_paths() -> None:
+    """Point the existing engine config to Excel files that exist in this checkout.
+
+    The older scene engine constants may reference scene libraries without the
+    `_executable.xlsx` suffix, while the repository currently stores the
+    executable scene libraries with that suffix. This function does not rename,
+    copy, or transform Excel files. It only resolves config paths before the
+    existing loader runs.
+    """
+    for config in [*engine.SCENE_LIBRARIES, *engine.TRANSITION_LIBRARIES]:
+        current = ROOT / str(config["file"])
+        if current.exists():
+            config["file"] = str(current)
+            continue
+
+        if current.suffix == ".xlsx":
+            candidate = current.with_name(f"{current.stem}_executable{current.suffix}")
+            if candidate.exists():
+                config["file"] = str(candidate)
+                continue
+
+        raise FileNotFoundError(f"Required library file not found: {config['file']}")
+
+
 @dataclass
 class MatchState:
     minute: int = 12
@@ -70,7 +94,11 @@ class EpisodeResult:
     scene_steps: List[SceneStep]
 
 
-def executable_actions(scene_id: str, scene: engine.Scene, transitions: Dict[engine.TransitionKey, List[engine.Transition]]) -> List[str]:
+def executable_actions(
+    scene_id: str,
+    scene: engine.Scene,
+    transitions: Dict[engine.TransitionKey, List[engine.Transition]],
+) -> List[str]:
     return [
         action
         for action in scene["available_player_actions"]
@@ -87,6 +115,7 @@ def choose_start_scene(match_state: MatchState, scenes: Dict[str, engine.Scene])
 
 def classify_episode(scene_steps: List[SceneStep]) -> Tuple[bool, bool, List[str]]:
     tags: List[str] = []
+
     turnover = any(
         step.owner_before != "OPPONENT_WITH_BALL"
         and step.owner_after == "OPPONENT_WITH_BALL"
@@ -97,6 +126,7 @@ def classify_episode(scene_steps: List[SceneStep]) -> Tuple[bool, bool, List[str
         and step.owner_after == "PLAYER_WITH_BALL"
         for step in scene_steps
     )
+
     max_tier = max(step.next_tier for step in scene_steps)
     created_chance = max_tier >= 3 and not turnover
 
@@ -142,6 +172,7 @@ def run_episode(
 
         transition = random.choice(options)
         next_scene_id, resolver = engine.resolve_next_scene(scenes, current_scene_id, transition)
+
         if resolver != "allowed_next_scene_ids":
             raise ValueError(f"Bridge must use allowed_next_scene_ids resolver, got: {resolver}")
         if not next_scene_id or next_scene_id not in scenes:
@@ -257,7 +288,12 @@ def verify_bridge(
     }
 
 
-def write_report(match_state_before: MatchState, match_state_after: MatchState, result: EpisodeResult, verification: Dict[str, object]) -> None:
+def write_report(
+    match_state_before: MatchState,
+    match_state_after: MatchState,
+    result: EpisodeResult,
+    verification: Dict[str, object],
+) -> None:
     lines = [
         "# MVP Match Bridge Verification Report",
         "",
@@ -317,7 +353,7 @@ def write_report(match_state_before: MatchState, match_state_after: MatchState, 
         "",
         f"- selected start scene exists: {verification['start_scene_id']}",
         f"- bounded episode steps: {verification['steps_played']}",
-        f"- observer/reputation fields emitted: no",
+        "- observer/reputation fields emitted: no",
     ]
 
     if verification["errors"]:
@@ -329,6 +365,7 @@ def write_report(match_state_before: MatchState, match_state_after: MatchState, 
 
 def main() -> int:
     random.seed(RANDOM_SEED)
+    resolve_library_paths()
 
     scenes = engine.load_scenes()
     transitions, transition_rows = engine.load_transitions()
