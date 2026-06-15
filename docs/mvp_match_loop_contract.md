@@ -96,6 +96,44 @@ Off-ball attacking and defensive participation are part of the MVP match loop.
 
 ---
 
+## Start Ownership Selection
+
+Playable episodes must not always start from the same scene.
+
+The start ownership state must depend on match pressure.
+
+Pressure means match-level pressure by team, currently represented as:
+
+* `pressure_a`;
+* `pressure_b`.
+
+MVP rule:
+
+* when team A pressure is higher, playable episodes should more often start from a team-A possession state;
+* when team B pressure is higher, playable episodes should more often start from a team-B possession state;
+* when pressure is balanced, start ownership distribution should remain mixed.
+
+For the player-side MVP model, team-A possession can produce:
+
+* `PLAYER_WITH_BALL` starts;
+* `TEAMMATE_WITH_BALL` starts.
+
+Team-B possession can produce:
+
+* `OPPONENT_WITH_BALL` starts.
+
+This must be a weighted dependency, not a hard deterministic rule.
+
+High pressure should increase probability, not force every episode into the same ownership state.
+
+The selector must avoid trivial repetition such as every playable episode starting from `fb_player_0002`.
+
+A safe first implementation may use audited start-scene pools per ownership state.
+
+It must not infer start-scene suitability from scene text without verification.
+
+---
+
 ## Non-Playable Critical Match Events
 
 The match may contain critical events where the player character is not directly involved.
@@ -184,6 +222,9 @@ The first multi-episode match loop implementation must verify:
 * score can be changed by playable episode results;
 * score can be changed by non-playable critical goal events;
 * penalty and red-card events can be logged without player choice;
+* start ownership varies across playable episodes when pressure conditions justify it;
+* higher team pressure increases the probability of that team's possession ownership starting an episode;
+* audited start-scene pools are used instead of text inference;
 * observer, reputation, relationship and career memory are not modified;
 * existing scene graph verification still passes before match loop execution;
 * bridge verification still passes before or during match loop execution.
@@ -197,6 +238,7 @@ The next MVP implementation target is:
 ```text
 match initialization
 -> scheduled playable episodes across 90 minutes + added time
+-> pressure-weighted start ownership selection
 -> playable episode execution through the bridge
 -> match state updates
 -> critical non-playable event logging
@@ -204,4 +246,4 @@ match initialization
 -> match loop verification report
 ```
 
-The next code artifact should be a small multi-episode match loop, not a new gameplay layer.
+The next code artifact should extend the small multi-episode match loop with audited pressure-based start ownership selection, not add a new gameplay layer.
