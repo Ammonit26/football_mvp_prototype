@@ -203,7 +203,11 @@ def load_scenes() -> Dict[str, Scene]:
             owner = safe_str(row.get("scene_owner")) or config["owner"]
             player_position = safe_str(row.get("player_position"))
             ball_holder_position = safe_str(row.get("ball_holder_position"))
+            scene_type = safe_str(row.get("scene_type")).lower() or "dynamic"
+            if scene_type not in {"dynamic", "static"}:
+                scene_type = "dynamic"
             scenes[scene_id] = {
+                "scene_type": scene_type,
                 "owner": owner,
                 "player_position": player_position,
                 "player_direction": safe_str(row.get("player_direction")),
@@ -384,6 +388,10 @@ def verify_graph(
 
     for scene_id, scene in scenes.items():
         actions = scene["available_player_actions"]
+        if scene.get("scene_type") == "static":
+            if not transitions.get((scene_id, "CONTINUE", "SUCCESS")):
+                missing_transitions.append((scene_id, "CONTINUE", "SUCCESS"))
+            continue
         if not actions:
             scenes_without_actions.append(scene_id)
             continue
@@ -483,7 +491,7 @@ def verify_graph(
     dead_end_scenes = sorted(
         scene_id
         for scene_id, scene in scenes.items()
-        if not scene["available_player_actions"] or outgoing[scene_id] == 0
+        if (scene.get("scene_type") != "static" and not scene["available_player_actions"]) or outgoing[scene_id] == 0
     )
     dead_end_pools = [
         (row["transition_id"], row["source_scene_id"], scene_id)
@@ -491,7 +499,7 @@ def verify_graph(
         for scene_id in row.get("allowed_next_scene_ids", [])
         if scene_id in scenes
         and (
-            not scenes[scene_id]["available_player_actions"]
+            (scenes[scene_id].get("scene_type") != "static" and not scenes[scene_id]["available_player_actions"])
             or outgoing[scene_id] == 0
         )
     ]
@@ -538,18 +546,25 @@ def run_single_simulation(
         scene = scenes.get(current_scene_id)
         if not scene:
             return step, False, f"scene not found: {current_scene_id}", fallback_count
-        actions = [
-            action
-            for action in scene["available_player_actions"]
-            if transitions.get((current_scene_id, action, "SUCCESS"))
-            and transitions.get((current_scene_id, action, "FAIL"))
-        ]
-        if not actions:
-            return step, False, f"no executable actions at {current_scene_id}", fallback_count
+        if scene.get("scene_type") == "static":
+            key = (current_scene_id, "CONTINUE", "SUCCESS")
+            transition_options = transitions.get(key, [])
+            if not transition_options:
+                return step, False, f"no CONTINUE transition at static scene {current_scene_id}", fallback_count
+            transition = random.choice(transition_options)
+        else:
+            actions = [
+                action
+                for action in scene["available_player_actions"]
+                if transitions.get((current_scene_id, action, "SUCCESS"))
+                and transitions.get((current_scene_id, action, "FAIL"))
+            ]
+            if not actions:
+                return step, False, f"no executable actions at {current_scene_id}", fallback_count
 
-        action = random.choice(actions)
-        outcome = random.choice(["SUCCESS", "FAIL"])
-        transition = random.choice(transitions[(current_scene_id, action, outcome)])
+            action = random.choice(actions)
+            outcome = random.choice(["SUCCESS", "FAIL"])
+            transition = random.choice(transitions[(current_scene_id, action, outcome)])
         next_scene_id, resolver = resolve_next_scene(scenes, current_scene_id, transition)
         if resolver != "allowed_next_scene_ids":
             fallback_count += 1
@@ -599,12 +614,16 @@ def print_scene(scene_id: str, scene: Scene, step: int, max_steps: int) -> None:
     print("\n" + "=" * 72)
     print(f"Step: {step}/{max_steps}")
     print(f"Scene ID: {scene_id}")
+    print(f"Scene type: {scene.get('scene_type', 'dynamic')}")
     print(f"Ball ownership: {scene['owner']}")
     print("\nScene:")
     print(f"  {scene.get('narrative') or '(no narrative_scene)'}")
-    print("\nAvailable player actions:")
-    for index, action in enumerate(scene["available_player_actions"], start=1):
-        print(f"  {index}. {action}")
+    if scene.get("scene_type") == "static":
+        print("\nPress Enter to continue.")
+    else:
+        print("\nAvailable player actions:")
+        for index, action in enumerate(scene["available_player_actions"], start=1):
+            print(f"  {index}. {action}")
     print("=" * 72)
 
 
@@ -641,28 +660,41 @@ def run_interactive_match(
             print_match_log(match_log)
             return 1
 
-        actions = scene["available_player_actions"]
-        if not actions:
-            print(f"Match stopped: scene has no available actions: {current_scene_id}")
-            print_match_log(match_log)
-            return 1
-
         print_scene(current_scene_id, scene, step, max_steps)
-        action = choose_player_action(actions)
-        if action is None:
-            print("Match finished by player.")
-            print_match_log(match_log)
-            return 0
 
-        outcome = random.choice(["SUCCESS", "FAIL"])
-        key = (current_scene_id, action, outcome)
-        transition_options = transitions.get(key, [])
-        if not transition_options:
-            print(f"ERROR: no transition for {key}")
-            print_match_log(match_log)
-            return 1
+        if scene.get("scene_type") == "static":
+            input()
+            action = "CONTINUE"
+            outcome = "SUCCESS"
+            key = (current_scene_id, action, outcome)
+            transition_options = transitions.get(key, [])
+            if not transition_options:
+                print(f"ERROR: no CONTINUE transition for static scene {current_scene_id}")
+                print_match_log(match_log)
+                return 1
+            transition = random.choice(transition_options)
+        else:
+            actions = scene["available_player_actions"]
+            if not actions:
+                print(f"Match stopped: dynamic scene has no available actions: {current_scene_id}")
+                print_match_log(match_log)
+                return 1
 
-        transition = random.choice(transition_options)
+            action = choose_player_action(actions)
+            if action is None:
+                print("Match finished by player.")
+                print_match_log(match_log)
+                return 0
+
+            outcome = random.choice(["SUCCESS", "FAIL"])
+            key = (current_scene_id, action, outcome)
+            transition_options = transitions.get(key, [])
+            if not transition_options:
+                print(f"ERROR: no transition for {key}")
+                print_match_log(match_log)
+                return 1
+
+            transition = random.choice(transition_options)
         next_scene_id, resolver = resolve_next_scene(scenes, current_scene_id, transition)
         if not next_scene_id:
             print(f"ERROR: no next scene from {current_scene_id}")
@@ -670,9 +702,12 @@ def run_interactive_match(
             return 1
 
         next_scene = scenes[next_scene_id]
-        print("\nAction result:")
-        print(f"  Action: {action}")
-        print(f"  Outcome: {outcome}")
+        if scene.get("scene_type") == "static":
+            print("\nContinue:")
+        else:
+            print("\nAction result:")
+            print(f"  Action: {action}")
+            print(f"  Outcome: {outcome}")
         print(f"  Transition: {transition.get('transition_id') or '(no transition_id)'}")
         print(f"  Resolver: {resolver}")
         print(f"  New scene: {next_scene_id}")
