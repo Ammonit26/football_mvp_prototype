@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional
 
 from openpyxl import load_workbook
 
@@ -103,6 +103,13 @@ def optional(headers: Dict[str, int], names: Iterable[str]) -> Optional[int]:
     return None
 
 
+def read_cell(ws, headers: Dict[str, int], row: int, names: Iterable[str], default: str = "") -> str:
+    col = optional(headers, names)
+    if col is None:
+        return default
+    return safe(ws.cell(row=row, column=col).value)
+
+
 def ensure_column(ws, name: str) -> int:
     headers = header_map(ws)
     if name in headers:
@@ -124,7 +131,7 @@ def set_if_present(ws, headers: Dict[str, int], row: int, column_name: str, valu
 
 def load_scene_records() -> Dict[str, SceneRecord]:
     scenes: Dict[str, SceneRecord] = {}
-    for owner, (path, sheet_name) in SCENE_LIBRARIES.items():
+    for default_owner, (path, sheet_name) in SCENE_LIBRARIES.items():
         wb = load_workbook(path)
         ws = wb[sheet_name]
         ensure_column(ws, "scene_type")
@@ -132,25 +139,30 @@ def load_scene_records() -> Dict[str, SceneRecord]:
         scene_id_col = require(headers, ["scene_id"])
         scene_type_col = require(headers, ["scene_type"])
         changed = False
+
         for row in range(2, ws.max_row + 1):
             if not safe(ws.cell(row=row, column=scene_type_col).value):
                 ws.cell(row=row, column=scene_type_col).value = "dynamic"
                 changed = True
+
             scene_id = safe(ws.cell(row=row, column=scene_id_col).value)
             if not scene_id:
                 continue
+
+            owner = read_cell(ws, headers, row, ["scene_owner", "owner"], default_owner) or default_owner
             scenes[scene_id] = SceneRecord(
                 scene_id=scene_id,
-                owner=safe(ws.cell(row=row, column=optional(headers, ["scene_owner"]) or 0).value) or owner,
-                player_position=safe(ws.cell(row=row, column=optional(headers, ["player_position"]) or 0).value),
-                player_direction=safe(ws.cell(row=row, column=optional(headers, ["player_direction"]) or 0).value),
-                ball_holder_position=safe(ws.cell(row=row, column=optional(headers, ["ball_holder_position"]) or 0).value),
-                ball_holder_direction=safe(ws.cell(row=row, column=optional(headers, ["ball_holder_direction"]) or 0).value),
-                ball_holder_action=safe(ws.cell(row=row, column=optional(headers, ["ball_holder_action"]) or 0).value),
-                available_player_actions=safe(ws.cell(row=row, column=optional(headers, ["available_player_actions"]) or 0).value),
-                narrative_scene=safe(ws.cell(row=row, column=optional(headers, ["narrative_scene"]) or 0).value),
-                scene_type=safe(ws.cell(row=row, column=scene_type_col).value).lower() or "dynamic",
+                owner=owner,
+                player_position=read_cell(ws, headers, row, ["player_position"]),
+                player_direction=read_cell(ws, headers, row, ["player_direction"]),
+                ball_holder_position=read_cell(ws, headers, row, ["ball_holder_position"]),
+                ball_holder_direction=read_cell(ws, headers, row, ["ball_holder_direction"]),
+                ball_holder_action=read_cell(ws, headers, row, ["ball_holder_action"]),
+                available_player_actions=read_cell(ws, headers, row, ["available_player_actions"]),
+                narrative_scene=read_cell(ws, headers, row, ["narrative_scene", "narrative"]),
+                scene_type=(safe(ws.cell(row=row, column=scene_type_col).value).lower() or "dynamic"),
             )
+
         if changed:
             wb.save(path)
             print(f"DEFAULT_SCENE_TYPE_FILLED {path.name}")
@@ -163,9 +175,9 @@ def action_bucket(action: str) -> str:
         return "shot"
     if "дриблинг" in lower or "пройти" in lower or "обыграть" in lower or "вести" in lower:
         return "carry_dribble"
-    if "пас" in lower or "передач" in lower or "заброс" in lower or "навес" in lower or "прострел" in lower or "отдать" in lower or "сыграть" in lower:
+    if any(token in lower for token in ["пас", "передач", "заброс", "навес", "прострел", "отдать", "сыграть"]):
         return "pass_cross"
-    if "отбор" in lower or "накрыть" in lower or "перехват" in lower or "закрывать" in lower or "оттянуться" in lower or "зоне" in lower or "рывок" in lower:
+    if any(token in lower for token in ["отбор", "накрыть", "перехват", "закрывать", "оттянуться", "зоне", "рывок"]):
         return "defensive_action"
     if "отскок" in lower or "рикошет" in lower or "подбор" in lower:
         return "second_ball"
@@ -176,17 +188,17 @@ def static_text(source_scene: SceneRecord, action: str, outcome: str, owner_afte
     bucket = action_bucket(action)
     ok = outcome.upper() == "SUCCESS"
     if bucket == "shot":
-        return "Удар завершает развитие атаки. Мяч меняет фазу эпизода, и игрок получает следующую ситуацию уже после реакции защиты и вратаря."
+        return "Удар меняет фазу эпизода. Следующая сцена начинается уже после реакции защиты и вратаря."
     if bucket == "carry_dribble" and ok:
-        return "Действие проходит. Игрок продвигает мяч и заставляет соперника перестраиваться, прежде чем возникает следующая игровая ситуация."
+        return "Продвижение проходит. Соперник вынужден перестраиваться, и следующая ситуация возникает уже в новой фазе атаки."
     if bucket == "carry_dribble" and not ok:
         return "Соперник срывает продвижение. Мяч меняет владельца, и эпизод сразу переходит в новую фазу под давлением."
     if bucket == "pass_cross" and ok:
-        return "Передача проходит. Мяч доходит до адресата, и атака получает продолжение уже в новой расстановке игроков."
+        return "Передача проходит. Мяч доходит до адресата, и атака получает продолжение уже в новой расстановке."
     if bucket == "pass_cross" and not ok:
         return "Передача не проходит. Соперник читает направление мяча, и владение переходит к другой команде."
     if bucket == "defensive_action" and ok:
-        return "Оборонительное действие срабатывает. Опасность частично снята, и следующая фаза начинается уже после этого вмешательства."
+        return "Оборонительное действие срабатывает. Опасность частично снята, и следующая фаза начинается после этого вмешательства."
     if bucket == "defensive_action" and not ok:
         return "Попытка оборонительного действия не останавливает атаку. Соперник сохраняет темп и получает следующую ситуацию."
     if bucket == "second_ball" and ok:
@@ -230,25 +242,28 @@ def collect_transition_patches(scenes: Dict[str, SceneRecord]) -> List[Transitio
                 continue
             if action == CONTINUE_ACTION and outcome == CONTINUE_OUTCOME:
                 continue
+
             source_scene = scenes.get(source_scene_id)
             if not source_scene or source_scene.scene_type == "static":
                 continue
+
             allowed_pool = split_pool(ws.cell(row=row, column=allowed_col).value)
             if is_transition_already_wrapped(allowed_pool, scenes):
                 continue
+
             transition_id = safe(ws.cell(row=row, column=transition_id_col).value) if transition_id_col else ""
-            suffix = stable_suffix(library_key, transition_id, source_scene_id, action, outcome, str(row))
-            static_scene_id = f"{STATIC_PREFIX}{library_key}_{suffix}"
-            static_transition_id = f"{STATIC_TRANSITION_PREFIX}{library_key}_{suffix}"
             owner_after = safe(ws.cell(row=row, column=owner_col).value) or source_scene.owner
             if owner_after not in SCENE_LIBRARIES:
                 continue
+
             original_next = safe(ws.cell(row=row, column=next_col).value) if next_col else ""
             original_allowed = join_pool(allowed_pool)
             if not original_allowed and original_next:
                 original_allowed = original_next
             if not original_allowed:
                 continue
+
+            suffix = stable_suffix(library_key, transition_id, source_scene_id, action, outcome, str(row))
             patches.append(
                 TransitionPatch(
                     library_key=library_key,
@@ -265,8 +280,8 @@ def collect_transition_patches(scenes: Dict[str, SceneRecord]) -> List[Transitio
                     ball_holder_direction_after=safe(ws.cell(row=row, column=ball_holder_dir_after_col).value) if ball_holder_dir_after_col else source_scene.ball_holder_direction,
                     original_next_scene_id=original_next or split_pool(original_allowed)[0],
                     original_allowed_next_scene_ids=original_allowed,
-                    static_scene_id=static_scene_id,
-                    static_transition_id=static_transition_id,
+                    static_scene_id=f"{STATIC_PREFIX}{library_key}_{suffix}",
+                    static_transition_id=f"{STATIC_TRANSITION_PREFIX}{library_key}_{suffix}",
                     static_text=static_text(source_scene, action, outcome, owner_after),
                 )
             )
@@ -287,6 +302,7 @@ def patch_scene_libraries(patches: List[TransitionPatch]) -> None:
         scene_id_col = require(headers, ["scene_id"])
         created = 0
         updated = 0
+
         for patch in owner_patches:
             existing = find_rows(ws, scene_id_col, patch.static_scene_id)
             if existing:
@@ -295,9 +311,11 @@ def patch_scene_libraries(patches: List[TransitionPatch]) -> None:
             else:
                 row = ws.max_row + 1
                 created += 1
+
             values = {
                 "scene_id": patch.static_scene_id,
                 "scene_owner": patch.ball_owner_after,
+                "owner": patch.ball_owner_after,
                 "player_position": patch.player_position_after,
                 "player_direction": patch.player_direction_after,
                 "ball_holder_position": patch.ball_holder_position_after,
@@ -309,6 +327,7 @@ def patch_scene_libraries(patches: List[TransitionPatch]) -> None:
             }
             for col_name, value in values.items():
                 set_if_present(ws, headers, row, col_name, value)
+
         wb.save(path)
         print(f"SCENE_LIBRARY_PATCHED {path.name}: created={created}, updated={updated}")
 
@@ -334,17 +353,19 @@ def patch_transition_libraries(patches: List[TransitionPatch]) -> None:
         player_dir_after_col = optional(headers, ["player_direction_after"])
         ball_holder_pos_after_col = optional(headers, ["ball_holder_position_after"])
         ball_holder_dir_after_col = optional(headers, ["ball_holder_direction_after"])
+
         transition_id_to_row: Dict[str, int] = {}
         if transition_id_col is not None:
             for row in range(2, ws.max_row + 1):
                 transition_id = safe(ws.cell(row=row, column=transition_id_col).value)
                 if transition_id:
                     transition_id_to_row[transition_id] = row
+
         created = 0
         updated = 0
         redirected = 0
+
         for patch in library_patches:
-            # Re-read row by index; this script does not insert above existing rows.
             source_row = patch.source_row
             ws.cell(row=source_row, column=allowed_col).value = patch.static_scene_id
             if next_col is not None:
@@ -380,6 +401,7 @@ def patch_transition_libraries(patches: List[TransitionPatch]) -> None:
                 ws.cell(row=static_row, column=ball_holder_pos_after_col).value = patch.ball_holder_position_after
             if ball_holder_dir_after_col is not None:
                 ws.cell(row=static_row, column=ball_holder_dir_after_col).value = patch.ball_holder_direction_after
+
         wb.save(path)
         print(f"TRANSITION_LIBRARY_PATCHED {path.name}: redirected={redirected}, static_created={created}, static_updated={updated}")
 
