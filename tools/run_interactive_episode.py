@@ -4,7 +4,7 @@ import argparse
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pandas as pd
 
@@ -23,6 +23,22 @@ CANONICAL_SCENE_FILES = {
 STATIC_ACTION = "CONTINUE"
 STATIC_OUTCOME = "SUCCESS"
 DEFAULT_MAX_DYNAMIC_SCENES = 5
+
+STATE_FIELD_PAIRS = [
+    ("ball_owner_after", "owner"),
+    ("player_position_after", "player_position"),
+    ("player_direction_after", "player_direction"),
+    ("ball_holder_position_after", "ball_holder_position"),
+    ("ball_holder_direction_after", "ball_holder_direction"),
+]
+
+
+def norm(value: object) -> str:
+    return str(value or "").strip().lower().replace("ё", "е")
+
+
+def split_scene_pool(raw: object) -> List[str]:
+    return [part.strip() for part in str(raw or "").split("||") if part.strip()]
 
 
 def resolve_canonical_files() -> None:
@@ -71,6 +87,80 @@ def enrich_scene_types(scenes: Dict[str, engine.Scene]) -> None:
             scenes[scene_id]["scene_type"] = scene_type
 
 
+def transition_scene_pool(transition: engine.Transition) -> List[str]:
+    pool = split_scene_pool(transition.get("allowed_next_scene_ids", ""))
+    if pool:
+        return pool
+    next_scene = str(transition.get("next_scene_id", "") or transition.get("target_scene_id", "")).strip()
+    return [next_scene] if next_scene else []
+
+
+def state_score(transition: engine.Transition, scene: engine.Scene) -> Tuple[int, List[str]]:
+    score = 0
+    mismatches: List[str] = []
+    for transition_field, scene_field in STATE_FIELD_PAIRS:
+        expected = str(transition.get(transition_field, "") or "").strip()
+        if not expected:
+            continue
+        actual = str(scene.get(scene_field, "") or "").strip()
+        if norm(expected) == norm(actual):
+            score += 1
+        else:
+            score -= 10
+            mismatches.append(f"{transition_field}: expected={expected!r}, actual={actual!r}")
+    return score, mismatches
+
+
+def resolve_next_scene_state_aware(
+    scenes: Dict[str, engine.Scene],
+    current_scene_id: str,
+    transition: engine.Transition,
+) -> Tuple[str, str, str]:
+    pool = transition_scene_pool(transition)
+    if not pool:
+        return "", "state_resolver_empty_pool", "no allowed_next_scene_ids / next_scene_id"
+
+    candidates = []
+    missing = []
+    for scene_id in pool:
+        scene = scenes.get(scene_id)
+        if scene is None:
+            missing.append(scene_id)
+            continue
+        score, mismatches = state_score(transition, scene)
+        candidates.append((score, len(mismatches), scene_id, mismatches))
+
+    if not candidates:
+        return "", "state_resolver_missing_all", f"missing candidates: {missing}"
+
+    exact = [item for item in candidates if item[1] == 0]
+    if exact:
+        best_score = max(item[0] for item in exact)
+        best = [item for item in exact if item[0] == best_score]
+        chosen = random.choice(best)
+        return chosen[2], "state_resolver_exact", f"exact_candidates={len(exact)} pool={len(pool)}"
+
+    # Fallback keeps the episode playable but exposes the problem loudly.
+    candidates.sort(key=lambda item: (item[1], -item[0], item[2]))
+    chosen = candidates[0]
+    detail = "; ".join(chosen[3][:3])
+    if len(chosen[3]) > 3:
+        detail += f"; +{len(chosen[3]) - 3} more"
+    return chosen[2], "state_resolver_fallback_mismatch", detail
+
+
+def resolve_next_scene_selected(
+    scenes: Dict[str, engine.Scene],
+    current_scene_id: str,
+    transition: engine.Transition,
+    resolver_mode: str,
+) -> Tuple[str, str, str]:
+    if resolver_mode == "random":
+        next_scene_id, resolver = engine.resolve_next_scene(scenes, current_scene_id, transition)
+        return next_scene_id, resolver, "legacy random/allowed_next_scene_ids resolver"
+    return resolve_next_scene_state_aware(scenes, current_scene_id, transition)
+
+
 def print_scene_static_aware(scene_id: str, scene: engine.Scene, step: int, max_steps: int, dynamic_count: int, max_dynamic_scenes: int) -> None:
     scene_type = str(scene.get("scene_type", "dynamic"))
     print("\n" + "=" * 72)
@@ -115,6 +205,7 @@ def run_interactive_match_static_aware(
     start_scene_id: str,
     max_steps: int,
     max_dynamic_scenes: int,
+    resolver_mode: str,
 ) -> int:
     current_scene_id = start_scene_id
     match_log: List[Dict[str, object]] = []
@@ -124,6 +215,7 @@ def run_interactive_match_static_aware(
     print("PEFL-style event flow: static match events plus occasional player decisions.")
     print("You make decisions only in dynamic scenes. Static scenes show match events.")
     print(f"Episode dynamic-scene limit: {max_dynamic_scenes}")
+    print(f"Next-scene resolver: {resolver_mode}")
     print("Enter q at any dynamic action prompt to finish the match.")
 
     for step in range(1, max_steps + 1):
@@ -164,9 +256,11 @@ def run_interactive_match_static_aware(
             return 1
 
         transition = random.choice(transition_options)
-        next_scene_id, resolver = engine.resolve_next_scene(scenes, current_scene_id, transition)
+        next_scene_id, resolver, resolver_detail = resolve_next_scene_selected(scenes, current_scene_id, transition, resolver_mode)
         if not next_scene_id:
             print(f"ERROR: no next scene from {current_scene_id}")
+            print(f"Resolver: {resolver}")
+            print(f"Resolver detail: {resolver_detail}")
             engine.print_match_log(match_log)
             return 1
 
@@ -177,12 +271,14 @@ def run_interactive_match_static_aware(
             print(f"  Outcome: {outcome}")
             print(f"  Transition: {transition.get('transition_id') or '(no transition_id)'}")
             print(f"  Resolver: {resolver}")
+            print(f"  Resolver detail: {resolver_detail}")
             print(f"  New scene: {next_scene_id}")
             print(f"  New ball ownership: {next_scene['owner']}")
         else:
             print("\nStatic transition:")
             print(f"  Transition: {transition.get('transition_id') or '(no transition_id)'}")
             print(f"  Resolver: {resolver}")
+            print(f"  Resolver detail: {resolver_detail}")
             print(f"  New scene: {next_scene_id}")
             print(f"  New ball ownership: {next_scene['owner']}")
 
@@ -195,6 +291,7 @@ def run_interactive_match_static_aware(
                 "action": action,
                 "outcome": outcome,
                 "transition_id": transition.get("transition_id", ""),
+                "resolver": resolver,
                 "next_scene_id": next_scene_id,
                 "owner_after": next_scene["owner"],
             }
@@ -234,6 +331,12 @@ def parse_args() -> argparse.Namespace:
         help=f"Maximum dynamic decision scenes per episode. Default: {DEFAULT_MAX_DYNAMIC_SCENES}",
     )
     parser.add_argument(
+        "--resolver",
+        choices=["state", "random"],
+        default="state",
+        help="Next-scene resolver mode. state = score by transition state_after; random = legacy resolver.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=engine.RANDOM_SEED,
@@ -264,6 +367,7 @@ def main() -> int:
         start_scene_id=start_scene,
         max_steps=args.max_steps,
         max_dynamic_scenes=args.max_dynamic_scenes,
+        resolver_mode=args.resolver,
     )
 
 
