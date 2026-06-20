@@ -22,6 +22,7 @@ CANONICAL_SCENE_FILES = {
 
 STATIC_ACTION = "CONTINUE"
 STATIC_OUTCOME = "SUCCESS"
+DEFAULT_MAX_DYNAMIC_SCENES = 5
 
 
 def resolve_canonical_files() -> None:
@@ -70,13 +71,14 @@ def enrich_scene_types(scenes: Dict[str, engine.Scene]) -> None:
             scenes[scene_id]["scene_type"] = scene_type
 
 
-def print_scene_static_aware(scene_id: str, scene: engine.Scene, step: int, max_steps: int) -> None:
+def print_scene_static_aware(scene_id: str, scene: engine.Scene, step: int, max_steps: int, dynamic_count: int, max_dynamic_scenes: int) -> None:
     scene_type = str(scene.get("scene_type", "dynamic"))
     print("\n" + "=" * 72)
     print(f"Step: {step}/{max_steps}")
     print(f"Scene ID: {scene_id}")
     print(f"Scene type: {scene_type}")
     print(f"Ball ownership: {scene['owner']}")
+    print(f"Dynamic scene budget: {dynamic_count}/{max_dynamic_scenes}")
     print("\nScene:")
     print(f"  {scene.get('narrative') or '(no narrative_scene)'}")
     if scene_type == "dynamic":
@@ -88,17 +90,40 @@ def print_scene_static_aware(scene_id: str, scene: engine.Scene, step: int, max_
     print("=" * 72)
 
 
+def print_forced_episode_end(next_scene_id: str, next_scene: engine.Scene, dynamic_count: int) -> None:
+    print("\n" + "=" * 72)
+    print("Episode end: forced static scene")
+    print(f"Dynamic scene limit reached: {dynamic_count}")
+    print("\nScene:")
+    print(
+        "  Эпизод исчерпывает себя. Игра уходит в следующую фазу матча, "
+        "а новая важная ситуация будет начата отдельным эпизодом."
+    )
+    print("\nNext episode candidate:")
+    print(f"  Scene ID: {next_scene_id}")
+    print(f"  Ball ownership: {next_scene['owner']}")
+    print("=" * 72)
+
+
+def should_force_episode_end(next_scene: engine.Scene, dynamic_count: int, max_dynamic_scenes: int) -> bool:
+    return dynamic_count >= max_dynamic_scenes and str(next_scene.get("scene_type", "dynamic")) == "dynamic"
+
+
 def run_interactive_match_static_aware(
     scenes: Dict[str, engine.Scene],
     transitions: Dict[engine.TransitionKey, List[engine.Transition]],
     start_scene_id: str,
     max_steps: int,
+    max_dynamic_scenes: int,
 ) -> int:
     current_scene_id = start_scene_id
     match_log: List[Dict[str, object]] = []
+    dynamic_count = 0
 
     print("\nInteractive player mode")
+    print("PEFL-style event flow: static match events plus occasional player decisions.")
     print("You make decisions only in dynamic scenes. Static scenes show match events.")
+    print(f"Episode dynamic-scene limit: {max_dynamic_scenes}")
     print("Enter q at any dynamic action prompt to finish the match.")
 
     for step in range(1, max_steps + 1):
@@ -109,7 +134,10 @@ def run_interactive_match_static_aware(
             return 1
 
         scene_type = str(scene.get("scene_type", "dynamic"))
-        print_scene_static_aware(current_scene_id, scene, step, max_steps)
+        if scene_type == "dynamic":
+            dynamic_count += 1
+
+        print_scene_static_aware(current_scene_id, scene, step, max_steps, dynamic_count, max_dynamic_scenes)
 
         if scene_type == "static":
             input("\nPress Enter to continue...")
@@ -163,6 +191,7 @@ def run_interactive_match_static_aware(
                 "step": step,
                 "source_scene_id": current_scene_id,
                 "owner_before": scene["owner"],
+                "scene_type": scene_type,
                 "action": action,
                 "outcome": outcome,
                 "transition_id": transition.get("transition_id", ""),
@@ -170,6 +199,12 @@ def run_interactive_match_static_aware(
                 "owner_after": next_scene["owner"],
             }
         )
+
+        if should_force_episode_end(next_scene, dynamic_count, max_dynamic_scenes):
+            print_forced_episode_end(next_scene_id, next_scene, dynamic_count)
+            engine.print_match_log(match_log)
+            return 0
+
         current_scene_id = next_scene_id
 
     print(f"Match finished after reaching max steps: {max_steps}")
@@ -179,7 +214,7 @@ def run_interactive_match_static_aware(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run interactive episode simulation using canonical repository Excel files."
+        description="Run PEFL-style interactive episode simulation using canonical repository Excel files."
     )
     parser.add_argument(
         "--start-scene",
@@ -190,7 +225,13 @@ def parse_args() -> argparse.Namespace:
         "--max-steps",
         type=int,
         default=engine.MAX_STEPS,
-        help=f"Maximum interactive steps. Default: {engine.MAX_STEPS}",
+        help=f"Maximum total scene steps. Default: {engine.MAX_STEPS}",
+    )
+    parser.add_argument(
+        "--max-dynamic-scenes",
+        type=int,
+        default=DEFAULT_MAX_DYNAMIC_SCENES,
+        help=f"Maximum dynamic decision scenes per episode. Default: {DEFAULT_MAX_DYNAMIC_SCENES}",
     )
     parser.add_argument(
         "--seed",
@@ -222,6 +263,7 @@ def main() -> int:
         transitions=transitions,
         start_scene_id=start_scene,
         max_steps=args.max_steps,
+        max_dynamic_scenes=args.max_dynamic_scenes,
     )
 
 
