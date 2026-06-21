@@ -24,6 +24,8 @@ STATIC_ACTION = "CONTINUE"
 STATIC_OUTCOME = "SUCCESS"
 DEFAULT_MAX_DYNAMIC_SCENES = 5
 
+# State Resolver V1: exact state matching only.
+# If no exact dynamic scene exists, fallback to the legacy allowed_next_scene_ids resolver.
 STATE_FIELD_PAIRS = [
     ("ball_owner_after", "owner"),
     ("player_position_after", "player_position"),
@@ -35,10 +37,6 @@ STATE_FIELD_PAIRS = [
 
 def norm(value: object) -> str:
     return str(value or "").strip().lower().replace("ё", "е")
-
-
-def split_scene_pool(raw: object) -> List[str]:
-    return [part.strip() for part in str(raw or "").split("||") if part.strip()]
 
 
 def resolve_canonical_files() -> None:
@@ -87,66 +85,44 @@ def enrich_scene_types(scenes: Dict[str, engine.Scene]) -> None:
             scenes[scene_id]["scene_type"] = scene_type
 
 
-def transition_scene_pool(transition: engine.Transition) -> List[str]:
-    pool = split_scene_pool(transition.get("allowed_next_scene_ids", ""))
-    if pool:
-        return pool
-    next_scene = str(transition.get("next_scene_id", "") or transition.get("target_scene_id", "")).strip()
-    return [next_scene] if next_scene else []
-
-
-def state_score(transition: engine.Transition, scene: engine.Scene) -> Tuple[int, List[str]]:
-    score = 0
-    mismatches: List[str] = []
+def scene_matches_state_after(transition: engine.Transition, scene: engine.Scene) -> bool:
     for transition_field, scene_field in STATE_FIELD_PAIRS:
         expected = str(transition.get(transition_field, "") or "").strip()
         if not expected:
             continue
         actual = str(scene.get(scene_field, "") or "").strip()
-        if norm(expected) == norm(actual):
-            score += 1
-        else:
-            score -= 10
-            mismatches.append(f"{transition_field}: expected={expected!r}, actual={actual!r}")
-    return score, mismatches
+        if norm(expected) != norm(actual):
+            return False
+    return True
 
 
-def resolve_next_scene_state_aware(
+def find_exact_dynamic_scenes(
+    scenes: Dict[str, engine.Scene],
+    transition: engine.Transition,
+) -> List[str]:
+    exact: List[str] = []
+    for scene_id, scene in scenes.items():
+        if str(scene.get("scene_type", "dynamic")) == "static":
+            continue
+        if scene_matches_state_after(transition, scene):
+            exact.append(scene_id)
+    return sorted(exact)
+
+
+def resolve_next_scene_state_v1(
     scenes: Dict[str, engine.Scene],
     current_scene_id: str,
     transition: engine.Transition,
 ) -> Tuple[str, str, str]:
-    pool = transition_scene_pool(transition)
-    if not pool:
-        return "", "state_resolver_empty_pool", "no allowed_next_scene_ids / next_scene_id"
-
-    candidates = []
-    missing = []
-    for scene_id in pool:
-        scene = scenes.get(scene_id)
-        if scene is None:
-            missing.append(scene_id)
-            continue
-        score, mismatches = state_score(transition, scene)
-        candidates.append((score, len(mismatches), scene_id, mismatches))
-
-    if not candidates:
-        return "", "state_resolver_missing_all", f"missing candidates: {missing}"
-
-    exact = [item for item in candidates if item[1] == 0]
+    exact = find_exact_dynamic_scenes(scenes, transition)
     if exact:
-        best_score = max(item[0] for item in exact)
-        best = [item for item in exact if item[0] == best_score]
-        chosen = random.choice(best)
-        return chosen[2], "state_resolver_exact", f"exact_candidates={len(exact)} pool={len(pool)}"
+        chosen = random.choice(exact)
+        return chosen, "state_resolver_v1_exact", f"exact_dynamic_candidates={len(exact)}"
 
-    # Fallback keeps the episode playable but exposes the problem loudly.
-    candidates.sort(key=lambda item: (item[1], -item[0], item[2]))
-    chosen = candidates[0]
-    detail = "; ".join(chosen[3][:3])
-    if len(chosen[3]) > 3:
-        detail += f"; +{len(chosen[3]) - 3} more"
-    return chosen[2], "state_resolver_fallback_mismatch", detail
+    next_scene_id, legacy_resolver = engine.resolve_next_scene(scenes, current_scene_id, transition)
+    if not next_scene_id:
+        return "", "state_resolver_v1_no_exact_no_fallback", "no exact dynamic scene and legacy resolver returned no scene"
+    return next_scene_id, "state_resolver_v1_fallback", f"no exact dynamic scene; fallback={legacy_resolver}"
 
 
 def resolve_next_scene_selected(
@@ -158,7 +134,7 @@ def resolve_next_scene_selected(
     if resolver_mode == "random":
         next_scene_id, resolver = engine.resolve_next_scene(scenes, current_scene_id, transition)
         return next_scene_id, resolver, "legacy random/allowed_next_scene_ids resolver"
-    return resolve_next_scene_state_aware(scenes, current_scene_id, transition)
+    return resolve_next_scene_state_v1(scenes, current_scene_id, transition)
 
 
 def print_scene_static_aware(scene_id: str, scene: engine.Scene, step: int, max_steps: int, dynamic_count: int, max_dynamic_scenes: int) -> None:
@@ -334,7 +310,7 @@ def parse_args() -> argparse.Namespace:
         "--resolver",
         choices=["state", "random"],
         default="state",
-        help="Next-scene resolver mode. state = score by transition state_after; random = legacy resolver.",
+        help="Next-scene resolver mode. state = State Resolver V1 exact dynamic-state matching; random = legacy resolver.",
     )
     parser.add_argument(
         "--seed",
