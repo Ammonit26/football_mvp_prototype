@@ -34,6 +34,16 @@ def split_ids(value):
     return [part.strip() for part in clean(value).split("||") if part.strip()]
 
 
+def choose_outcome_column(columns):
+    if "player_action_outcome" in columns:
+        return "player_action_outcome"
+    if "teammate_action_outcome" in columns:
+        return "teammate_action_outcome"
+    if "outcome" in columns:
+        return "outcome"
+    return None
+
+
 def load_scenes():
     scenes = {}
     for library, path in SCENE_FILES:
@@ -58,26 +68,35 @@ def load_scenes():
 def load_continue_edges():
     edges = {}
     duplicate_sources = Counter()
+    outcome_columns_used = Counter()
+
     for library, path in TRANSITION_FILES:
         df = pd.read_excel(path, dtype=str, keep_default_na=False)
-        outcome_col = "player_action_outcome" if "player_action_outcome" in df.columns else "outcome"
+        outcome_col = choose_outcome_column(df.columns)
+        outcome_columns_used[f"{library}:{outcome_col or 'NONE'}"] += 1
+
         for _, row in df.iterrows():
             source = clean(row.get("source_scene_id"))
             action = clean(row.get("player_action"))
-            outcome = clean(row.get(outcome_col)).upper()
+            outcome = clean(row.get(outcome_col)).upper() if outcome_col else ""
+
             if not source or action != "CONTINUE" or outcome != "SUCCESS":
                 continue
+
             pool = split_ids(row.get("allowed_next_scene_ids")) or split_ids(row.get("next_scene_id"))
             if not pool:
                 continue
+
             if source in edges:
                 duplicate_sources[source] += 1
+
             edges[source] = {
                 "library": library,
                 "transition_id": clean(row.get("transition_id")),
                 "targets": pool,
             }
-    return edges, duplicate_sources
+
+    return edges, duplicate_sources, outcome_columns_used
 
 
 def expand_chain(start_ids, scenes, continue_edges, max_depth=3):
@@ -130,7 +149,7 @@ def consensus(values):
 
 def main():
     scenes = load_scenes()
-    continue_edges, duplicate_continue_sources = load_continue_edges()
+    continue_edges, duplicate_continue_sources, outcome_columns_used = load_continue_edges()
     df = pd.read_excel(TARGET_TRANSITIONS, dtype=str, keep_default_na=False)
 
     rows = []
@@ -147,9 +166,14 @@ def main():
         transition_id = clean(row.get("transition_id"))
         ball_owner_after = clean(row.get("ball_owner_after"))
         start_ids = split_ids(row.get("allowed_next_scene_ids")) or split_ids(row.get("next_scene_id"))
+
         dynamic_targets, chain_flags = expand_chain(start_ids, scenes, continue_edges)
         target_scenes = [scenes[scene_id] for scene_id, _ in dynamic_targets if scene_id in scenes]
-        owner_matched = [scene for scene in target_scenes if not ball_owner_after or clean(scene.get("scene_owner")) == ball_owner_after]
+        owner_matched = [
+            scene
+            for scene in target_scenes
+            if not ball_owner_after or clean(scene.get("scene_owner")) == ball_owner_after
+        ]
 
         target_count = len(dynamic_targets)
         owner_match_count = len(owner_matched)
@@ -204,6 +228,11 @@ def main():
     lines.append(f"- continue_edges_loaded: {len(continue_edges)}")
     lines.append(f"- duplicate_continue_sources: {sum(duplicate_continue_sources.values())}")
     lines.append(f"- detailed_csv: {CSV.name}")
+    lines.append("")
+    lines.append("## Outcome Columns Used")
+    lines.append("")
+    for key, value in sorted(outcome_columns_used.items()):
+        lines.append(f"- {key}: {value}")
     lines.append("")
     lines.append("## Status Counts")
     lines.append("")
