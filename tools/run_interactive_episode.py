@@ -30,7 +30,7 @@ DEFAULT_MAX_DYNAMIC_SCENES = 5
 # static CONTINUE -> dynamic scene from that static transition.allowed_next_scene_ids
 # No global state search. No topology fallback. No runtime static bridge.
 
-SHOT_NARRATIVE_MARKERS = [
+SHOT_STATIC_NARRATIVE_MARKERS = [
     "бьёт",
     "бьет",
     "пробивает",
@@ -38,6 +38,31 @@ SHOT_NARRATIVE_MARKERS = [
     "наносит удар",
     "ударил",
     "добивает",
+]
+
+SHOT_DYNAMIC_CONTEXT_MARKERS = [
+    "партнер: бьет по воротам",
+    "партнер: бьет",
+    "партнёр: бьет по воротам",
+    "партнёр: бьет",
+    "партнер: находит момент для удара",
+    "партнёр: находит момент для удара",
+    "бьет по воротам",
+    "находит момент для удара",
+]
+
+SHOT_PLAYER_ACTION_MARKERS = [
+    "ударить по воротам",
+    "бить по воротам",
+    "пробить по воротам",
+    "нанести удар",
+]
+
+NON_SHOT_ACTION_MARKERS = [
+    "пас под удар",
+    "открыться под удар",
+    "готов откатить под удар",
+    "под удар",
 ]
 
 SHOT_TERMINAL_OUTCOMES = [
@@ -126,6 +151,10 @@ SHOT_TERMINAL_OUTCOMES = [
         "next_owner": "LOOSE_BALL",
     },
 ]
+
+
+def norm_text(value: object) -> str:
+    return str(value or "").strip().lower().replace("ё", "е")
 
 
 def split_scene_pool(raw: object) -> List[str]:
@@ -278,22 +307,42 @@ def resolve_next_scene_random(
     return next_scene_id, resolver, "legacy random/allowed_next_scene_ids resolver"
 
 
+def text_has_any_marker(text: str, markers: List[str]) -> bool:
+    normalized = norm_text(text)
+    normalized_markers = [norm_text(marker) for marker in markers]
+    return any(marker in normalized for marker in normalized_markers)
+
+
 def is_shot_static_scene(scene: engine.Scene) -> bool:
     if str(scene.get("scene_type", "dynamic")) != "static":
         return False
-    narrative = str(scene.get("narrative") or "").lower().replace("ё", "е")
-    markers = [marker.replace("ё", "е") for marker in SHOT_NARRATIVE_MARKERS]
-    return any(marker in narrative for marker in markers)
+    return text_has_any_marker(str(scene.get("narrative") or ""), SHOT_STATIC_NARRATIVE_MARKERS)
+
+
+def is_shot_dynamic_context(scene: engine.Scene, action: str) -> bool:
+    """Detect actual shot context before entering the following static bridge.
+
+    Pas/opening 'под удар' is not a shot by itself. A teammate dynamic scene
+    with 'Партнер: Бьет по воротам' or 'Находит момент для удара' is a shot
+    context even if the player's own action is off-ball rebound positioning.
+    """
+    action_text = norm_text(action)
+    if text_has_any_marker(action_text, SHOT_PLAYER_ACTION_MARKERS) and not text_has_any_marker(action_text, NON_SHOT_ACTION_MARKERS):
+        return True
+
+    narrative = str(scene.get("narrative") or "")
+    return text_has_any_marker(narrative, SHOT_DYNAMIC_CONTEXT_MARKERS)
 
 
 def resolve_shot_terminal_outcome() -> Dict[str, str]:
     return random.choice(SHOT_TERMINAL_OUTCOMES)
 
 
-def print_shot_terminal_event(current_scene_id: str, outcome: Dict[str, str]) -> None:
+def print_shot_terminal_event(current_scene_id: str, outcome: Dict[str, str], reason: str) -> None:
     print("\n" + "=" * 72)
     print("Shot terminal outcome")
     print(f"Source static scene: {current_scene_id}")
+    print(f"Trigger: {reason}")
     print(f"Outcome: {outcome['code']} — {outcome['label']}")
     print("\nScene:")
     print(f"  {outcome['narrative']}")
@@ -387,6 +436,8 @@ def run_interactive_match_static_aware(
     current_scene_id = start_scene_id
     match_log: List[Dict[str, object]] = []
     dynamic_count = 0
+    pending_shot_terminal = False
+    pending_shot_reason = ""
 
     if resolver_mode == "state":
         resolver_mode = "local"
@@ -415,9 +466,12 @@ def run_interactive_match_static_aware(
 
         if scene_type == "static":
             input("\nPress Enter to continue...")
-            if resolver_mode != "random" and is_shot_static_scene(scene):
+            if resolver_mode != "random" and (pending_shot_terminal or is_shot_static_scene(scene)):
                 terminal = resolve_shot_terminal_outcome()
-                print_shot_terminal_event(current_scene_id, terminal)
+                reason = pending_shot_reason or "static narrative marker"
+                pending_shot_terminal = False
+                pending_shot_reason = ""
+                print_shot_terminal_event(current_scene_id, terminal, reason)
                 match_log.append(
                     {
                         "step": step,
@@ -448,6 +502,12 @@ def run_interactive_match_static_aware(
                 engine.print_match_log(match_log)
                 return 0
             outcome = random.choice(["SUCCESS", "FAIL"])
+            if resolver_mode != "random" and is_shot_dynamic_context(scene, action):
+                pending_shot_terminal = True
+                pending_shot_reason = f"dynamic shot context: {current_scene_id}; action={action}"
+            else:
+                pending_shot_terminal = False
+                pending_shot_reason = ""
 
         key = (current_scene_id, action, outcome)
         transition_options = transitions.get(key, [])
@@ -489,6 +549,8 @@ def run_interactive_match_static_aware(
             print(f"  Resolver detail: {resolver_detail}")
             print(f"  New scene: {next_scene_id}")
             print(f"  New ball ownership: {next_scene['owner']}")
+            if pending_shot_terminal:
+                print(f"  Pending terminal: SHOT ({pending_shot_reason})")
         else:
             print("\nStatic transition:")
             print(f"  Transition: {transition.get('transition_id') or '(no transition_id)'}")
