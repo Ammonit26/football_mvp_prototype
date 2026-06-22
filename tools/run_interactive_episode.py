@@ -30,6 +30,103 @@ DEFAULT_MAX_DYNAMIC_SCENES = 5
 # static CONTINUE -> dynamic scene from that static transition.allowed_next_scene_ids
 # No global state search. No topology fallback. No runtime static bridge.
 
+SHOT_NARRATIVE_MARKERS = [
+    "бьёт",
+    "бьет",
+    "пробивает",
+    "пробил",
+    "наносит удар",
+    "ударил",
+    "добивает",
+]
+
+SHOT_TERMINAL_OUTCOMES = [
+    {
+        "code": "GOAL",
+        "label": "Гол",
+        "narrative": "Мяч оказывается в сетке. Эпизод завершается голом.",
+        "next_owner": "CENTER_RESTART",
+    },
+    {
+        "code": "MISS_GOAL_KICK",
+        "label": "Мимо / удар от ворот",
+        "narrative": "Удар проходит мимо ворот. Игра будет продолжена ударом от ворот.",
+        "next_owner": "OPPONENT_WITH_BALL",
+    },
+    {
+        "code": "KEEPER_HELD",
+        "label": "Вратарь фиксирует мяч",
+        "narrative": "Вратарь забирает мяч намертво. Атака закончена.",
+        "next_owner": "OPPONENT_WITH_BALL",
+    },
+    {
+        "code": "SAVE_CORNER",
+        "label": "Сейв / угловой",
+        "narrative": "Вратарь отбивает удар за лицевую. Будет угловой.",
+        "next_owner": "SET_PIECE_CORNER",
+    },
+    {
+        "code": "SAVE_REBOUND_PLAYER",
+        "label": "Сейв / отскок к персонажу",
+        "narrative": "Вратарь отбивает перед собой. Ты первым оказываешься на отскоке.",
+        "next_owner": "PLAYER_WITH_BALL",
+    },
+    {
+        "code": "SAVE_REBOUND_TEAMMATE",
+        "label": "Сейв / отскок к партнёру",
+        "narrative": "Вратарь отбивает мяч в сторону. На подборе первым оказывается партнёр.",
+        "next_owner": "TEAMMATE_WITH_BALL",
+    },
+    {
+        "code": "SAVE_REBOUND_OPPONENT",
+        "label": "Сейв / вынос соперником",
+        "narrative": "После сейва защитник первым успевает к мячу и выносит его из опасной зоны.",
+        "next_owner": "OPPONENT_WITH_BALL",
+    },
+    {
+        "code": "POST_CORNER",
+        "label": "Штанга / угловой",
+        "narrative": "Мяч попадает в каркас ворот и уходит за лицевую. Будет угловой.",
+        "next_owner": "SET_PIECE_CORNER",
+    },
+    {
+        "code": "POST_REBOUND_PLAYER",
+        "label": "Штанга / отскок к персонажу",
+        "narrative": "Мяч звенит о штангу и отскакивает в твою зону.",
+        "next_owner": "PLAYER_WITH_BALL",
+    },
+    {
+        "code": "POST_REBOUND_TEAMMATE",
+        "label": "Штанга / отскок к партнёру",
+        "narrative": "Мяч попадает в штангу и отскакивает к партнёру.",
+        "next_owner": "TEAMMATE_WITH_BALL",
+    },
+    {
+        "code": "POST_REBOUND_OPPONENT",
+        "label": "Штанга / отскок к сопернику",
+        "narrative": "Мяч отскакивает от штанги, и соперник первым играет на подборе.",
+        "next_owner": "OPPONENT_WITH_BALL",
+    },
+    {
+        "code": "DEFLECTION_GOAL",
+        "label": "Рикошет / гол",
+        "narrative": "После рикошета мяч меняет траекторию и влетает в ворота.",
+        "next_owner": "CENTER_RESTART",
+    },
+    {
+        "code": "DEFLECTION_CORNER",
+        "label": "Рикошет / угловой",
+        "narrative": "Мяч задевает соперника и уходит за лицевую. Будет угловой.",
+        "next_owner": "SET_PIECE_CORNER",
+    },
+    {
+        "code": "DEFLECTION_POST",
+        "label": "Рикошет / штанга",
+        "narrative": "Рикошет меняет траекторию, мяч попадает в штангу и остаётся в игре.",
+        "next_owner": "LOOSE_BALL",
+    },
+]
+
 
 def split_scene_pool(raw: object) -> List[str]:
     """Parse scene pools stored as either scene1||scene2 or ['scene1', 'scene2']."""
@@ -181,6 +278,32 @@ def resolve_next_scene_random(
     return next_scene_id, resolver, "legacy random/allowed_next_scene_ids resolver"
 
 
+def is_shot_static_scene(scene: engine.Scene) -> bool:
+    if str(scene.get("scene_type", "dynamic")) != "static":
+        return False
+    narrative = str(scene.get("narrative") or "").lower().replace("ё", "е")
+    markers = [marker.replace("ё", "е") for marker in SHOT_NARRATIVE_MARKERS]
+    return any(marker in narrative for marker in markers)
+
+
+def resolve_shot_terminal_outcome() -> Dict[str, str]:
+    return random.choice(SHOT_TERMINAL_OUTCOMES)
+
+
+def print_shot_terminal_event(current_scene_id: str, outcome: Dict[str, str]) -> None:
+    print("\n" + "=" * 72)
+    print("Shot terminal outcome")
+    print(f"Source static scene: {current_scene_id}")
+    print(f"Outcome: {outcome['code']} — {outcome['label']}")
+    print("\nScene:")
+    print(f"  {outcome['narrative']}")
+    print("\nEpisode end: shot outcome")
+    print(f"Next phase owner/context: {outcome['next_owner']}")
+    if outcome["code"] in {"GOAL", "DEFLECTION_GOAL"}:
+        print("Match event: GOAL. Score update layer is not implemented yet.")
+    print("=" * 72)
+
+
 def print_scene_static_aware(
     scene_id: str,
     scene: engine.Scene,
@@ -292,6 +415,25 @@ def run_interactive_match_static_aware(
 
         if scene_type == "static":
             input("\nPress Enter to continue...")
+            if resolver_mode != "random" and is_shot_static_scene(scene):
+                terminal = resolve_shot_terminal_outcome()
+                print_shot_terminal_event(current_scene_id, terminal)
+                match_log.append(
+                    {
+                        "step": step,
+                        "source_scene_id": current_scene_id,
+                        "owner_before": scene["owner"],
+                        "scene_type": scene_type,
+                        "action": "SHOT_TERMINAL",
+                        "outcome": terminal["code"],
+                        "transition_id": "shot_terminal_resolver",
+                        "resolver": "shot_terminal_resolver",
+                        "next_scene_id": "",
+                        "owner_after": terminal["next_owner"],
+                    }
+                )
+                engine.print_match_log(match_log)
+                return 0
             action = STATIC_ACTION
             outcome = STATIC_OUTCOME
         else:
