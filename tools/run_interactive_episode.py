@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import random
 import sys
 from pathlib import Path
@@ -17,12 +18,8 @@ import test_transitions_multi_executable as engine
 CANONICAL_SCENE_FILES = {
     "ball_at_player_normalized_prototype_v7.xlsx": "ball_at_player_normalized_prototype_v7_executable.xlsx",
     "ball_at_teammate_normalized_prototype_v1.xlsx": "ball_at_teammate_normalized_prototype_v1_executable.xlsx",
-    "ball_at_opponent_normalized_prototype_v2.xlsx": "ball_at_opponent_normalized_prototype_v1_executable.xlsx",
+    "ball_at_opponent_normalized_prototype_v2.xlsx": "ball_at_opponent_normalized_prototype_v2_executable.xlsx",
 }
-
-# Correct opponent canonical file name. Kept as explicit override in case older
-# configs still point at a non-executable workbook.
-CANONICAL_SCENE_FILES["ball_at_opponent_normalized_prototype_v2.xlsx"] = "ball_at_opponent_normalized_prototype_v2_executable.xlsx"
 
 STATIC_ACTION = "CONTINUE"
 STATIC_OUTCOME = "SUCCESS"
@@ -35,7 +32,25 @@ DEFAULT_MAX_DYNAMIC_SCENES = 5
 
 
 def split_scene_pool(raw: object) -> List[str]:
-    return [part.strip() for part in str(raw or "").split("||") if part.strip()]
+    """Parse scene pools stored as either scene1||scene2 or ['scene1', 'scene2']."""
+    if isinstance(raw, (list, tuple, set)):
+        return [str(part).strip() for part in raw if str(part).strip()]
+
+    text = str(raw or "").strip()
+    if not text:
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            parsed = None
+        if isinstance(parsed, (list, tuple, set)):
+            return [str(part).strip() for part in parsed if str(part).strip()]
+        if isinstance(parsed, str) and parsed.strip():
+            return [parsed.strip()]
+
+    return [part.strip().strip("'\"") for part in text.split("||") if part.strip().strip("'\"")]
 
 
 def resolve_canonical_files() -> None:
@@ -89,7 +104,7 @@ def transition_scene_pool(transition: engine.Transition) -> List[str]:
     if pool:
         return pool
     next_scene = str(transition.get("next_scene_id", "") or transition.get("target_scene_id", "")).strip()
-    return [next_scene] if next_scene else []
+    return split_scene_pool(next_scene) if next_scene else []
 
 
 def scene_type_of(scenes: Dict[str, engine.Scene], scene_id: str) -> str:
@@ -227,6 +242,17 @@ def print_state_gap(
     print("=" * 72)
 
 
+def choose_random_start_scene(scenes: Dict[str, engine.Scene]) -> str:
+    candidates = [
+        scene_id
+        for scene_id, scene in scenes.items()
+        if str(scene.get("scene_type", "dynamic")) == "dynamic" and scene.get("available_player_actions")
+    ]
+    if not candidates:
+        raise ValueError("No dynamic start-scene candidates with available actions")
+    return random.choice(sorted(candidates))
+
+
 def run_interactive_match_static_aware(
     scenes: Dict[str, engine.Scene],
     transitions: Dict[engine.TransitionKey, List[engine.Transition]],
@@ -248,6 +274,7 @@ def run_interactive_match_static_aware(
     print("You make decisions only in dynamic scenes. Static scenes show match events.")
     print(f"Episode dynamic-scene limit: {max_dynamic_scenes}")
     print(f"Next-scene resolver: {resolver_mode}")
+    print(f"Start scene: {start_scene_id}")
     print("Enter q at any dynamic action prompt to finish the match.")
 
     for step in range(1, max_steps + 1):
@@ -358,6 +385,7 @@ def run_interactive_match_static_aware(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run PEFL-style interactive episode simulation using canonical repository Excel files.")
     parser.add_argument("--start-scene", default=engine.START_SCENE, help=f"Scene ID to start from. Default: {engine.START_SCENE}")
+    parser.add_argument("--random-start", action="store_true", help="Start from a random dynamic scene with available actions.")
     parser.add_argument("--max-steps", type=int, default=engine.MAX_STEPS, help=f"Maximum total scene steps. Default: {engine.MAX_STEPS}")
     parser.add_argument("--max-dynamic-scenes", type=int, default=DEFAULT_MAX_DYNAMIC_SCENES, help=f"Maximum dynamic decision scenes per episode. Default: {DEFAULT_MAX_DYNAMIC_SCENES}")
     parser.add_argument("--resolver", choices=["local", "state", "random"], default="local", help="Next-scene resolver mode. local = dynamic->static->local static pool; state = deprecated alias for local; random = legacy resolver.")
@@ -375,7 +403,11 @@ def main() -> int:
     enrich_scene_types(scenes)
     transitions, _ = engine.load_transitions()
 
-    start_scene = args.start_scene
+    if args.random_start:
+        start_scene = choose_random_start_scene(scenes)
+    else:
+        start_scene = args.start_scene
+
     if start_scene not in scenes:
         sorted_ids = sorted(scenes)
         start_scene = sorted_ids[0]
