@@ -8,6 +8,10 @@ GOAL_CHANCE = {
     "tight": 0.18, "half": 0.30, "big": 0.45, "mistake": 0.60
 }
 
+CONTEXT_EVENT_COOLDOWN = 5
+SET_PIECE_SUBTYPES = ["corner", "free_kick", "penalty"]
+SET_PIECE_WEIGHTS = [0.50, 0.40, 0.10]
+
 def get_intensity_modifier(minute, score_diff, strength_diff, motivation_A, motivation_B, extra_time=False):
     if minute <= 15: minute_factor = 0.83
     elif 16 <= minute <= 30: minute_factor = 0.91
@@ -42,7 +46,129 @@ def get_intensity_modifier(minute, score_diff, strength_diff, motivation_A, moti
     return intensity_mod, finishing_mod
 
 
-def simulate_match(strength_diff=0, motivation_A=1.0, motivation_B=1.0):
+def _context_intensity(intensity_mod):
+    if intensity_mod < 0.9:
+        return "low"
+    if intensity_mod <= 1.3:
+        return "medium"
+    return "high"
+
+
+def _cooldown_active(team, cooldown_a, cooldown_b):
+    return (team == "A" and cooldown_a > 0) or (team == "B" and cooldown_b > 0)
+
+
+def _build_context_event(
+    minute,
+    team,
+    event_type,
+    subtype,
+    intensity_mod,
+    pressure_a,
+    pressure_b,
+    possession,
+    score_diff,
+):
+    return {
+        "minute": minute,
+        "team": team,
+        "event_type": event_type,
+        "subtype": subtype,
+        "intensity": _context_intensity(intensity_mod),
+        "pressure_a": pressure_a,
+        "pressure_b": pressure_b,
+        "possession": possession,
+        "score_diff": score_diff,
+    }
+
+
+def generate_context_event(
+    minute,
+    possession,
+    pressure_a,
+    pressure_b,
+    score_diff,
+    intensity_mod,
+    last_possession,
+    cooldown_a,
+    cooldown_b,
+):
+    possessing_pressure = pressure_a if possession == "A" else pressure_b
+    opponent_pressure = pressure_b if possession == "A" else pressure_a
+    team = possession
+
+    if _cooldown_active(team, cooldown_a, cooldown_b):
+        return None
+
+    if possessing_pressure >= 0.65:
+        if random.random() < 0.25:
+            return _build_context_event(
+                minute, team, "DANGEROUS_ATTACK", None,
+                intensity_mod, pressure_a, pressure_b, possession, score_diff
+            )
+        return None
+
+    if possession != last_possession and possessing_pressure <= 0.45:
+        if random.random() < 0.40:
+            return _build_context_event(
+                minute, team, "COUNTERATTACK", None,
+                intensity_mod, pressure_a, pressure_b, possession, score_diff
+            )
+        return None
+
+    if random.random() < 0.08:
+        subtype = random.choices(SET_PIECE_SUBTYPES, weights=SET_PIECE_WEIGHTS, k=1)[0]
+        return _build_context_event(
+            minute, team, "SET_PIECE", subtype,
+            intensity_mod, pressure_a, pressure_b, possession, score_diff
+        )
+
+    if opponent_pressure >= 0.70:
+        if random.random() < 0.20:
+            return _build_context_event(
+                minute, team, "DEFENSIVE_PRESSURE", None,
+                intensity_mod, pressure_a, pressure_b, possession, score_diff
+            )
+        return None
+
+    if opponent_pressure > possessing_pressure:
+        if random.random() < 0.15:
+            return _build_context_event(
+                minute, team, "POSSESSION_UNDER_PRESSURE", None,
+                intensity_mod, pressure_a, pressure_b, possession, score_diff
+            )
+        return None
+
+    return None
+
+
+def merge_event_logs(log, context_log):
+    """
+    Merge baseline and context logs into one minute-sorted timeline.
+    Baseline tuples are converted to dictionaries with event_source="baseline".
+    Context dictionaries are copied with event_source="context".
+    """
+    merged = []
+    for minute, possession, event_type, subtype in log:
+        merged.append({
+            "minute": minute,
+            "team": possession,
+            "possession": possession,
+            "event_type": event_type,
+            "subtype": subtype,
+            "event_source": "baseline",
+        })
+    for event in context_log:
+        item = dict(event)
+        item["event_source"] = "context"
+        merged.append(item)
+    return sorted(
+        merged,
+        key=lambda item: (item["minute"], 0 if item["event_source"] == "baseline" else 1),
+    )
+
+
+def simulate_match(strength_diff=0, motivation_A=1.0, motivation_B=1.0, include_context_log=False):
     score_a = 0; score_b = 0
     minute = 0
     possession = random.choice(["A", "B"])
@@ -52,6 +178,10 @@ def simulate_match(strength_diff=0, motivation_A=1.0, motivation_B=1.0):
     risk_threshold = 1.0
 
     log = []
+    context_log = []
+    cooldown_a = 0
+    cooldown_b = 0
+    last_possession = possession
     boost_until_A = 0; boost_until_B = 0
     boost_multiplier_A = 1.5; boost_multiplier_B = 1.5
 
@@ -60,6 +190,33 @@ def simulate_match(strength_diff=0, motivation_A=1.0, motivation_B=1.0):
 
     # Проверка на финальный режим (сумма мотиваций > 2.4)
     high_stakes = (motivation_A + motivation_B) > 2.4
+
+    def record_context_for_minute(intensity_mod):
+        nonlocal cooldown_a, cooldown_b, last_possession
+        if not include_context_log:
+            return
+
+        random_state = random.getstate()
+        ctx = generate_context_event(
+            minute, possession, pressure_A, pressure_B,
+            score_a - score_b, intensity_mod,
+            last_possession, cooldown_a, cooldown_b
+        )
+        random.setstate(random_state)
+
+        if ctx:
+            context_log.append(ctx)
+            if ctx["team"] == "A":
+                cooldown_a = CONTEXT_EVENT_COOLDOWN
+            else:
+                cooldown_b = CONTEXT_EVENT_COOLDOWN
+        else:
+            if cooldown_a > 0:
+                cooldown_a -= 1
+            if cooldown_b > 0:
+                cooldown_b -= 1
+
+        last_possession = possession
 
     while minute < total_duration:
         minute += 1
@@ -132,9 +289,11 @@ def simulate_match(strength_diff=0, motivation_A=1.0, motivation_B=1.0):
         if random.random() < switch_base:
             possession = "B" if possession == "A" else "A"
             risk *= 0.5
+            record_context_for_minute(intensity_mod)
             continue
 
         if risk < risk_threshold:
+            record_context_for_minute(intensity_mod)
             continue
 
         # Событие
@@ -199,6 +358,10 @@ def simulate_match(strength_diff=0, motivation_A=1.0, motivation_B=1.0):
                     log.append((minute, possession, "GOAL_REBOUND", event_type))
                     possession = "B" if possession == "A" else "A"
 
+        record_context_for_minute(intensity_mod)
+
+    if include_context_log:
+        return score_a, score_b, log, context_log
     return score_a, score_b, log
 
 
@@ -212,6 +375,98 @@ def simulate_many(n, strength_diff=0, motivation_A=1.0, motivation_B=1.0):
         if a == 0 and b == 0: zero_zero += 1
     avg_goals = total_goals / n
     return {"avg_goals": avg_goals, "0-0_rate": zero_zero / n, "results": results}
+
+
+def _result_stats(results):
+    total_goals = sum(a + b for a, b in results)
+    zero_zero = sum(1 for a, b in results if a == 0 and b == 0)
+    goals_a = sum(a for a, _ in results)
+    goals_b = sum(b for _, b in results)
+    return {
+        "avg_goals": total_goals / len(results),
+        "0-0_rate": zero_zero / len(results),
+        "score_distribution": Counter(results),
+        "goals_a": goals_a,
+        "goals_b": goals_b,
+    }
+
+
+def _print_result_comparison(title, stats):
+    print(title)
+    print(f"avg goals per match: {stats['avg_goals']:.3f}")
+    print(f"0-0 rate: {stats['0-0_rate']:.3%}")
+    print(f"A/B goal balance: {stats['goals_a']} / {stats['goals_b']}")
+    print("score distribution (top-10):")
+    for score, count in stats["score_distribution"].most_common(10):
+        print(f"  {score[0]}-{score[1]}: {count}")
+
+
+def audit_context_extension(n=1000, strength_diff=0, motivation_A=1.0, motivation_B=1.0):
+    """
+    Runs paired simulations with and without context events.
+    Context generation preserves the baseline random state, so scores should match.
+    """
+    baseline_results = []
+    context_results = []
+    context_counts = []
+    context_types = Counter()
+    context_teams = Counter()
+    context_intensity = Counter()
+
+    for _ in range(n):
+        random_state = random.getstate()
+        score_a, score_b, _ = simulate_match(strength_diff, motivation_A, motivation_B)
+        baseline_results.append((score_a, score_b))
+
+        random.setstate(random_state)
+        score_a_ctx, score_b_ctx, _, context_log = simulate_match(
+            strength_diff, motivation_A, motivation_B, include_context_log=True
+        )
+        context_results.append((score_a_ctx, score_b_ctx))
+        context_counts.append(len(context_log))
+        for event in context_log:
+            context_types[event["event_type"]] += 1
+            context_teams[event["team"]] += 1
+            context_intensity[event["intensity"]] += 1
+
+    baseline_stats = _result_stats(baseline_results)
+    context_stats = _result_stats(context_results)
+    avg_context = sum(context_counts) / len(context_counts)
+    avg_goal_delta = context_stats["avg_goals"] - baseline_stats["avg_goals"]
+    zero_context = sum(1 for count in context_counts if count == 0)
+    ten_plus_context = sum(1 for count in context_counts if count >= 10)
+
+    print("=== Result comparison: before / after ===")
+    _print_result_comparison("Before context events:", baseline_stats)
+    _print_result_comparison("After context events:", context_stats)
+    print(f"avg goals delta: {avg_goal_delta:+.3f}")
+
+    print("\n=== Context event statistics ===")
+    print(f"avg context events per match: {avg_context:.3f}")
+    print(f"min / max context events per match: {min(context_counts)} / {max(context_counts)}")
+    print(f"distribution by event_type: {dict(context_types)}")
+    print(f"distribution by team: {dict(context_teams)}")
+    print(f"distribution by intensity: {dict(context_intensity)}")
+    print(f"matches with 0 context events: {zero_context} ({zero_context / n:.3%})")
+    print(f"matches with 10+ context events: {ten_plus_context} ({ten_plus_context / n:.3%})")
+
+    print("\n=== Success criteria ===")
+    print(f"avg goals unchanged within +/-0.1: {abs(avg_goal_delta) <= 0.1}")
+    print(f"avg context events between 8 and 15: {8 <= avg_context <= 15}")
+    print(f"matches with 0 context events below 5%: {zero_context / n < 0.05}")
+
+    return {
+        "baseline": baseline_stats,
+        "with_context": context_stats,
+        "avg_goal_delta": avg_goal_delta,
+        "avg_context_events": avg_context,
+        "context_event_counts": context_counts,
+        "context_types": context_types,
+        "context_teams": context_teams,
+        "context_intensity": context_intensity,
+        "zero_context_rate": zero_context / n,
+        "ten_plus_context_rate": ten_plus_context / n,
+    }
 
 
 def save_results(stats, filename_prefix="match_results"):
